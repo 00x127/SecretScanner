@@ -4,12 +4,14 @@ import argparse
 import json
 import sys
 import time
+import logging
 from datetime import datetime
 from pathlib import Path
 from scanner import Scanner
 from utils import format_file_size
 
 def main():
+    # ... header print ...
     print("""
     +======================================================+
     |          SecretScanner - Git Leak Detector       |
@@ -21,6 +23,7 @@ def main():
     start_time = time.time()
 
     parser = argparse.ArgumentParser(
+    # ... args ...
         description='Enhanced Secret Scanner - Find hardcoded secrets in code',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -64,6 +67,14 @@ Examples:
     parser.add_argument('--update-patterns', action='store_true', help='Update secret patterns from remote')
 
     args = parser.parse_args()
+    
+    # Configure logging
+    log_level = logging.INFO if args.verbose else logging.WARNING
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
     
     # Validate arguments
     if args.severity:

@@ -5,6 +5,7 @@ import json
 import threading
 import signal
 import platform
+import logging
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -34,6 +35,7 @@ class Scanner:
         self.scan_start_time = None
         self.lock = threading.Lock()
         self.is_windows = platform.system() == "Windows"
+        self.logger = logging.getLogger("SecretScanner")
         
         # Setup timeout handler only on Unix-like systems
         if not self.is_windows:
@@ -95,32 +97,31 @@ class Scanner:
 
         except Exception as err:
             if self.show_progress:
-                print(f"[ERROR] Checking {file_path}: {err}")
+                self.logger.error(f"[ERROR] Checking {file_path}: {err}")
             with self.lock:
                 self.files_ignored += 1
             return False
 
-    def check_text_content(self, text_content, file_path, display_path):
-        text_lines = text_content.split('\n')
+    def _scan_line(self, line_text, line_number, file_path, display_path):
+        if not line_text.strip():
+            return
 
-        for line_number, line_text in enumerate(text_lines, 1):
-            if not line_text.strip():
-                continue
+        for pattern_name, (regex, risk_level) in SECRET_PATTERNS.items():
+            try:
+                for regex_match in re.finditer(regex, line_text, re.IGNORECASE):
+                    matched_text = extract_match_value(regex_match)
 
-            for pattern_name, (regex, risk_level) in SECRET_PATTERNS.items():
-                try:
-                    for regex_match in re.finditer(regex, line_text, re.IGNORECASE):
-                        matched_text = extract_match_value(regex_match)
+                    if len(matched_text) < 8 or len(matched_text) > 500:
+                        continue
 
-                        if len(matched_text) < 8 or len(matched_text) > 500:
-                            continue
+                    if looks_like_test_data(matched_text, line_text):
+                        continue
 
-                        if looks_like_test_data(matched_text, line_text):
-                            continue
+                    surrounding_text = line_text.strip()[:150]
 
-                        surrounding_text = line_text.strip()[:150]
-
-                        result_id = f"{display_path}:{line_number}:{pattern_name}:{matched_text}"
+                    result_id = f"{display_path}:{line_number}:{pattern_name}:{matched_text}"
+                    
+                    with self.lock:
                         if not any(r.get('_id') == result_id for r in self.results):
                             result_entry = {
                                 'type': pattern_name,
@@ -135,23 +136,21 @@ class Scanner:
                             self.results.append(result_entry)
 
                             if self.show_progress:
-                                print(f"[FOUND] {risk_level.upper()} - {pattern_name} in {display_path}:{line_number}")
+                                self.logger.info(f"[FOUND] {risk_level.upper()} - {pattern_name} in {display_path}:{line_number}")
 
-                except Exception as err:
-                    if self.show_progress:
-                        print(f"[ERROR] Pattern {pattern_name}: {err}")
-                    continue
+            except Exception as err:
+                if self.show_progress:
+                    self.logger.error(f"[ERROR] Pattern {pattern_name}: {err}")
+                continue
+
+    def check_text_content(self, text_content, file_path, display_path):
+        text_lines = text_content.split('\n')
+
+        for line_number, line_text in enumerate(text_lines, 1):
+            self._scan_line(line_text, line_number, file_path, display_path)
 
     def check_single_file(self, file_path, base_path=''):
         if not self.should_check_file(file_path):
-            return
-
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                file_contents = f.read()
-        except Exception as err:
-            if self.show_progress:
-                print(f"[ERROR] Reading {file_path}: {err}")
             return
 
         rel_path = os.path.relpath(file_path, base_path) if base_path else file_path
@@ -159,9 +158,16 @@ class Scanner:
             self.files_checked += 1
 
         if self.show_progress and self.files_checked % 25 == 0:
-            print(f"[*] Checked {self.files_checked} files...")
+            self.logger.info(f"[*] Checked {self.files_checked} files...")
 
-        self.check_text_content(file_contents, file_path, rel_path)
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line_number, line_text in enumerate(f, 1):
+                    self._scan_line(line_text, line_number, file_path, rel_path)
+        except Exception as err:
+            if self.show_progress:
+                self.logger.error(f"[ERROR] Reading {file_path}: {err}")
+            return
     
     def _check_files_parallel(self, file_list, base_path=''):
         """Check multiple files in parallel using ThreadPoolExecutor"""
@@ -174,13 +180,13 @@ class Scanner:
                     future.result()
                 except Exception as e:
                     if self.show_progress:
-                        print(f"[ERROR] in thread: {e}")
+                        self.logger.error(f"[ERROR] in thread: {e}")
 
     def check_commit_history(self, repo_dir, commit_limit=1000):
         if not os.path.exists(os.path.join(repo_dir, '.git')):
             return
 
-        print(f"\n[*] Checking git history...")
+        self.logger.info(f"\n[*] Checking git history...")
 
         try:
             git_log = subprocess.run(
@@ -192,11 +198,11 @@ class Scanner:
             )
 
             commit_hashes = git_log.stdout.strip().split('\n')
-            print(f"[*] Found {len(commit_hashes)} commits")
+            self.logger.info(f"[*] Found {len(commit_hashes)} commits")
 
             for idx, commit_id in enumerate(commit_hashes):
                 if idx % 100 == 0 and idx > 0:
-                    print(f"[*] Progress: {idx}/{len(commit_hashes)} commits")
+                    self.logger.info(f"[*] Progress: {idx}/{len(commit_hashes)} commits")
 
                 commit_diff = subprocess.run(
                     ['git', 'show', '--pretty=', '--unified=0', commit_id],
@@ -217,24 +223,24 @@ class Scanner:
                         if active_file:
                             self.check_text_content(added_content, active_file, f"{active_file} (commit {commit_id[:8]})")
 
-            print(f"[+] Checked {len(commit_hashes)} commits")
+            self.logger.info(f"[+] Checked {len(commit_hashes)} commits")
 
         except subprocess.TimeoutExpired:
-            print("[!] Git history check timed out")
+            self.logger.warning("[!] Git history check timed out")
         except Exception as err:
             if self.show_progress:
-                print(f"[!] Git history error: {err}")
+                self.logger.error(f"[!] Git history error: {err}")
 
     def check_directory(self, dir_path, include_subdirs=True, check_history=False, history_depth=1000):
         self.scan_start_time = datetime.now()
-        print(f"\n[*] Starting scan: {dir_path}")
+        self.logger.info(f"\n[*] Starting scan: {dir_path}")
         
         # Set timeout only on Unix-like systems
         if not self.is_windows:
             signal.alarm(self.timeout)
 
         if not os.path.exists(dir_path):
-            print(f"[!] Directory not found")
+            self.logger.warning(f"[!] Directory not found")
             return
 
         # Collect all files to scan
@@ -252,7 +258,7 @@ class Scanner:
                 if os.path.isfile(full_path) and self.should_check_file(full_path):
                     files_to_scan.append(full_path)
 
-        print(f"[*] Found {len(files_to_scan)} files to scan")
+        self.logger.info(f"[*] Found {len(files_to_scan)} files to scan")
         
         # Scan files in parallel
         if files_to_scan:
@@ -262,15 +268,15 @@ class Scanner:
         if not self.is_windows:
             signal.alarm(0)
 
-        print(f"\n[+] Scan complete")
-        print(f"[+] Files checked: {self.files_checked}")
-        print(f"[+] Files skipped: {self.files_ignored}")
+        self.logger.info(f"\n[+] Scan complete")
+        self.logger.info(f"[+] Files checked: {self.files_checked}")
+        self.logger.info(f"[+] Files skipped: {self.files_ignored}")
 
         if check_history:
             self.check_commit_history(dir_path, history_depth)
 
     def clone_and_check(self, repo_link, temp_location='/tmp', check_history=False, history_depth=1000):
-        print(f"\n[*] Cloning: {repo_link}")
+        self.logger.info(f"\n[*] Cloning: {repo_link}")
 
         repo_id = urlparse(repo_link).path.split('/')[-1].replace('.git', '')
         target_dir = os.path.join(temp_location, f"secretscan_{repo_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
@@ -285,16 +291,16 @@ class Scanner:
             )
 
             if clone_result.returncode != 0:
-                print(f"[!] Clone failed: {clone_result.stderr}")
+                self.logger.error(f"[!] Clone failed: {clone_result.stderr}")
                 return None
 
-            print(f"[+] Cloned to: {target_dir}")
+            self.logger.info(f"[+] Cloned to: {target_dir}")
 
         except subprocess.TimeoutExpired:
-            print("[!] Clone timeout")
+            self.logger.error("[!] Clone timeout")
             return None
         except Exception as err:
-            print(f"[!] Clone error: {err}")
+            self.logger.error(f"[!] Clone error: {err}")
             return None
 
         self.check_directory(target_dir, check_history=check_history, history_depth=history_depth)
