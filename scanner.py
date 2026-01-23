@@ -6,30 +6,34 @@ import threading
 import signal
 import platform
 import logging
+import time
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Optional, Any, Set, Tuple
 
-from patterns import SECRET_PATTERNS, SKIP_EXTENSIONS, SKIP_DIRECTORIES
-from utils import calc_entropy, check_if_binary, looks_like_test_data, extract_match_value, format_file_size
+# Assuming these modules exist in the same directory
+from patterns import SECRET_PATTERNS, SKIP_DIRECTORIES
+from utils import calc_entropy, check_if_binary, looks_like_test_data, extract_match_value
 
 class Scanner:
-    def __init__(self, show_progress=False, max_threads=4, entropy_threshold=3.5, 
-                 max_file_size=5*1024*1024, context_lines=3, exclude_paths=None, 
-                 include_extensions=None, severity_filter=None, no_color=False, timeout=300):
-        self.results = []
+    def __init__(self, show_progress: bool = False, max_threads: int = 4, entropy_threshold: float = 3.5, 
+                 max_file_size: int = 5*1024*1024, context_lines: int = 3, exclude_paths: Optional[List[str]] = None, 
+                 include_extensions: Optional[List[str]] = None, severity_filter: Optional[List[str]] = None, 
+                 no_color: bool = False, timeout: int = 300):
+        self.results: List[Dict[str, Any]] = []
         self.files_checked = 0
         self.files_ignored = 0
         self.show_progress = show_progress
-        self.max_threads = max_threads
+        self.max_threads = max_threads or os.cpu_count() or 4
         self.entropy_threshold = entropy_threshold
         self.max_file_size = max_file_size
         self.context_lines = context_lines
         self.exclude_paths = exclude_paths or []
-        self.include_extensions = include_extensions
-        self.severity_filter = severity_filter
+        self.include_extensions = set(include_extensions) if include_extensions else None
+        self.severity_filter = set(severity_filter) if severity_filter else None
         self.no_color = no_color
         self.timeout = timeout
         self.scan_start_time = None
@@ -37,14 +41,19 @@ class Scanner:
         self.is_windows = platform.system() == "Windows"
         self.logger = logging.getLogger("SecretScanner")
         
-        # Setup timeout handler only on Unix-like systems
-        if not self.is_windows:
-            signal.signal(signal.SIGALRM, self._timeout_handler)
+        # Compile patterns once at initialization for performance
+        self.compiled_patterns = []
+        for name, (pattern, severity) in SECRET_PATTERNS.items():
+            try:
+                self.compiled_patterns.append({
+                    'name': name,
+                    'regex': re.compile(pattern, re.IGNORECASE),
+                    'severity': severity
+                })
+            except re.error as e:
+                self.logger.error(f"Invalid regex for pattern '{name}': {e}")
 
-    def _timeout_handler(self, signum, frame):
-        raise TimeoutError("Scan timeout exceeded")
-    
-    def _colorize(self, text, color):
+    def _colorize(self, text: str, color: str) -> str:
         if self.no_color or self.is_windows:
             return text
         colors = {
@@ -59,35 +68,48 @@ class Scanner:
         }
         return f"{colors.get(color, '')}{text}{colors['reset']}"
     
-    def should_check_file(self, file_path):
+    def should_check_file(self, file_path: str) -> bool:
         try:
-            if not os.path.isfile(file_path):
+            path_obj = Path(file_path)
+            
+            # Check if file exists
+            if not path_obj.is_file():
                 return False
 
-            path_components = Path(file_path).parts
-            for skip_dir in list(SKIP_DIRECTORIES) + self.exclude_paths:
-                if skip_dir in path_components:
+            # Check directory exclusions
+            path_components = path_obj.parts
+            # Combine default skipped directories with user exclusions
+            skip_dirs = set(list(SKIP_DIRECTORIES) + self.exclude_paths)
+            
+            # Fast check for common skipped dirs in path
+            if any(part in skip_dirs for part in path_components):
+                 with self.lock:
+                    self.files_ignored += 1
+                 return False
+
+            # Check extension inclusion
+            if self.include_extensions:
+                file_ext = path_obj.suffix.lower()
+                if file_ext not in self.include_extensions:
                     with self.lock:
                         self.files_ignored += 1
                     return False
-
-            file_ext = Path(file_path).suffix.lower()
-            if self.include_extensions and file_ext not in self.include_extensions:
-                with self.lock:
-                    self.files_ignored += 1
-                return False
             
-            size = os.path.getsize(file_path)
-            if size > self.max_file_size:
+            # Check file size
+            try:
+                size = path_obj.stat().st_size
+            except OSError:
+                 # Handle cases where stat fails (permissions, etc)
+                with self.lock:
+                    self.files_ignored += 1
+                return False
+                
+            if size > self.max_file_size or size == 0:
                 with self.lock:
                     self.files_ignored += 1
                 return False
 
-            if size == 0:
-                with self.lock:
-                    self.files_ignored += 1
-                return False
-
+            # Check binary content (expensive check, do last)
             if check_if_binary(file_path):
                 with self.lock:
                     self.files_ignored += 1
@@ -102,66 +124,89 @@ class Scanner:
                 self.files_ignored += 1
             return False
 
-    def _scan_line(self, line_text, line_number, file_path, display_path):
-        if not line_text.strip():
+    def _scan_line(self, line_text: str, line_number: int, file_path: str, display_path: str):
+        if not line_text or len(line_text) > 4096: # Limit line length to prevent DOS
             return
 
-        for pattern_name, (regex, risk_level) in SECRET_PATTERNS.items():
+        line_text_stripped = line_text.strip()
+        if not line_text_stripped:
+            return
+
+        for pattern_data in self.compiled_patterns:
+            pattern_name = pattern_data['name']
+            regex = pattern_data['regex']
+            risk_level = pattern_data['severity']
+            
+            # Optimization: Quick check if regex might match
+            # This is hard with complex regexes, so we skip it and rely on re module optimization
+
             try:
-                for regex_match in re.finditer(regex, line_text, re.IGNORECASE):
+                for regex_match in regex.finditer(line_text):
                     matched_text = extract_match_value(regex_match)
 
+                    # Basic validation
                     if len(matched_text) < 8 or len(matched_text) > 500:
                         continue
 
                     if looks_like_test_data(matched_text, line_text):
                         continue
 
-                    surrounding_text = line_text.strip()[:150]
-
+                    surrounding_text = line_text_stripped[:150]
                     result_id = f"{display_path}:{line_number}:{pattern_name}:{matched_text}"
                     
                     with self.lock:
-                        if not any(r.get('_id') == result_id for r in self.results):
-                            result_entry = {
-                                'type': pattern_name,
-                                'severity': risk_level,
-                                'file': display_path,
-                                'line': line_number,
-                                'secret': matched_text,
-                                'entropy': round(calc_entropy(matched_text), 2),
-                                'context': surrounding_text,
-                                '_id': result_id
-                            }
-                            self.results.append(result_entry)
+                        # Avoid duplicates
+                        if any(r.get('_id') == result_id for r in self.results):
+                            continue
+                            
+                        result_entry = {
+                            'type': pattern_name,
+                            'severity': risk_level,
+                            'file': display_path,
+                            'line': line_number,
+                            'secret': matched_text,
+                            'entropy': round(calc_entropy(matched_text), 2),
+                            'context': surrounding_text,
+                            '_id': result_id
+                        }
+                        self.results.append(result_entry)
 
-                            if self.show_progress:
-                                self.logger.info(f"[FOUND] {risk_level.upper()} - {pattern_name} in {display_path}:{line_number}")
+                        if self.show_progress:
+                            self.logger.info(f"[FOUND] {risk_level.upper()} - {pattern_name} in {display_path}:{line_number}")
 
             except Exception as err:
+                # Log only if verbose, otherwise suppress per-line errors
                 if self.show_progress:
                     self.logger.error(f"[ERROR] Pattern {pattern_name}: {err}")
                 continue
 
-    def check_text_content(self, text_content, file_path, display_path):
+    def check_text_content(self, text_content: str, file_path: str, display_path: str):
+        if not text_content:
+            return
+            
         text_lines = text_content.split('\n')
-
         for line_number, line_text in enumerate(text_lines, 1):
             self._scan_line(line_text, line_number, file_path, display_path)
 
-    def check_single_file(self, file_path, base_path=''):
+    def check_single_file(self, file_path: str, base_path: str = ''):
+        # Check timeout
+        if self.scan_start_time and (datetime.now() - self.scan_start_time).total_seconds() > self.timeout:
+            return
+
         if not self.should_check_file(file_path):
             return
 
         rel_path = os.path.relpath(file_path, base_path) if base_path else file_path
+        
         with self.lock:
             self.files_checked += 1
 
-        if self.show_progress and self.files_checked % 25 == 0:
+        if self.show_progress and self.files_checked % 50 == 0:
             self.logger.info(f"[*] Checked {self.files_checked} files...")
 
         try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            # Use 'replace' to handle encoding errors gracefully without crashing
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 for line_number, line_text in enumerate(f, 1):
                     self._scan_line(line_text, line_number, file_path, rel_path)
         except Exception as err:
@@ -169,7 +214,7 @@ class Scanner:
                 self.logger.error(f"[ERROR] Reading {file_path}: {err}")
             return
     
-    def _check_files_parallel(self, file_list, base_path=''):
+    def _check_files_parallel(self, file_list: List[str], base_path: str = ''):
         """Check multiple files in parallel using ThreadPoolExecutor"""
         with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
             futures = {executor.submit(self.check_single_file, file_path, base_path): file_path 
@@ -181,8 +226,14 @@ class Scanner:
                 except Exception as e:
                     if self.show_progress:
                         self.logger.error(f"[ERROR] in thread: {e}")
+                
+                # Check timeout periodically
+                if self.scan_start_time and (datetime.now() - self.scan_start_time).total_seconds() > self.timeout:
+                    self.logger.warning("Scan timeout reached during parallel execution.")
+                    executor.shutdown(wait=False)
+                    break
 
-    def check_commit_history(self, repo_dir, commit_limit=1000):
+    def check_commit_history(self, repo_dir: str, commit_limit: int = 1000):
         if not os.path.exists(os.path.join(repo_dir, '.git')):
             return
 
@@ -190,27 +241,45 @@ class Scanner:
 
         try:
             git_log = subprocess.run(
-                ['git', 'log', '--all', '--pretty=format:%H', '--max-count=' + str(commit_limit)],
+                ['git', 'log', '--all', '--pretty=format:%H', f'--max-count={commit_limit}'],
                 cwd=repo_dir,
                 capture_output=True,
                 text=True,
                 timeout=60
             )
 
+            if git_log.returncode != 0:
+                self.logger.error(f"[!] Git log failed: {git_log.stderr}")
+                return
+
             commit_hashes = git_log.stdout.strip().split('\n')
+            if not commit_hashes or commit_hashes == ['']:
+                self.logger.info("[*] No commits found")
+                return
+                
             self.logger.info(f"[*] Found {len(commit_hashes)} commits")
 
             for idx, commit_id in enumerate(commit_hashes):
+                # Check timeout
+                if self.scan_start_time and (datetime.now() - self.scan_start_time).total_seconds() > self.timeout:
+                    self.logger.warning("Scan timeout reached during history check.")
+                    break
+
                 if idx % 100 == 0 and idx > 0:
                     self.logger.info(f"[*] Progress: {idx}/{len(commit_hashes)} commits")
 
-                commit_diff = subprocess.run(
-                    ['git', 'show', '--pretty=', '--unified=0', commit_id],
-                    cwd=repo_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
+                try:
+                    commit_diff = subprocess.run(
+                        ['git', 'show', '--pretty=', '--unified=0', commit_id],
+                        cwd=repo_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        encoding='utf-8', 
+                        errors='replace'
+                    )
+                except subprocess.TimeoutExpired:
+                    continue
 
                 active_file = None
                 for diff_line in commit_diff.stdout.split('\n'):
@@ -221,6 +290,8 @@ class Scanner:
                     elif diff_line.startswith('+') and not diff_line.startswith('+++'):
                         added_content = diff_line[1:]
                         if active_file:
+                            # We don't check exclusion for history as deleted secrets are relevant
+                            # regardless of current file filters often
                             self.check_text_content(added_content, active_file, f"{active_file} (commit {commit_id[:8]})")
 
             self.logger.info(f"[+] Checked {len(commit_hashes)} commits")
@@ -231,42 +302,39 @@ class Scanner:
             if self.show_progress:
                 self.logger.error(f"[!] Git history error: {err}")
 
-    def check_directory(self, dir_path, include_subdirs=True, check_history=False, history_depth=1000):
+    def check_directory(self, dir_path: str, include_subdirs: bool = True, check_history: bool = False, history_depth: int = 1000):
         self.scan_start_time = datetime.now()
         self.logger.info(f"\n[*] Starting scan: {dir_path}")
         
-        # Set timeout only on Unix-like systems
-        if not self.is_windows:
-            signal.alarm(self.timeout)
-
         if not os.path.exists(dir_path):
-            self.logger.warning(f"[!] Directory not found")
+            self.logger.warning(f"[!] Directory not found: {dir_path}")
             return
 
         # Collect all files to scan
         files_to_scan = []
-        if include_subdirs:
-            for root_dir, subdirs, file_list in os.walk(dir_path):
-                subdirs[:] = [d for d in subdirs if d not in SKIP_DIRECTORIES]
-                for file_name in file_list:
-                    full_path = os.path.join(root_dir, file_name)
-                    if self.should_check_file(full_path):
+        try:
+            if include_subdirs:
+                for root_dir, subdirs, file_list in os.walk(dir_path):
+                    # Modify subdirs in-place to skip directories
+                    subdirs[:] = [d for d in subdirs if d not in SKIP_DIRECTORIES and d not in self.exclude_paths]
+                    
+                    for file_name in file_list:
+                        full_path = os.path.join(root_dir, file_name)
                         files_to_scan.append(full_path)
-        else:
-            for item_name in os.listdir(dir_path):
-                full_path = os.path.join(dir_path, item_name)
-                if os.path.isfile(full_path) and self.should_check_file(full_path):
-                    files_to_scan.append(full_path)
+            else:
+                for item_name in os.listdir(dir_path):
+                    full_path = os.path.join(dir_path, item_name)
+                    if os.path.isfile(full_path):
+                        files_to_scan.append(full_path)
+        except Exception as e:
+            self.logger.error(f"Error traversing directory: {e}")
+            return
 
-        self.logger.info(f"[*] Found {len(files_to_scan)} files to scan")
+        self.logger.info(f"[*] Found {len(files_to_scan)} potential files to scan")
         
         # Scan files in parallel
         if files_to_scan:
             self._check_files_parallel(files_to_scan, dir_path)
-
-        # Disable timeout only on Unix-like systems
-        if not self.is_windows:
-            signal.alarm(0)
 
         self.logger.info(f"\n[+] Scan complete")
         self.logger.info(f"[+] Files checked: {self.files_checked}")
@@ -275,19 +343,27 @@ class Scanner:
         if check_history:
             self.check_commit_history(dir_path, history_depth)
 
-    def clone_and_check(self, repo_link, temp_location='/tmp', check_history=False, history_depth=1000):
+    def clone_and_check(self, repo_link: str, temp_location: str = '/tmp', check_history: bool = False, history_depth: int = 1000) -> Optional[str]:
         self.logger.info(f"\n[*] Cloning: {repo_link}")
 
-        repo_id = urlparse(repo_link).path.split('/')[-1].replace('.git', '')
-        target_dir = os.path.join(temp_location, f"secretscan_{repo_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        try:
+            repo_id = urlparse(repo_link).path.split('/')[-1].replace('.git', '')
+            target_dir = os.path.join(temp_location, f"secretscan_{repo_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        except Exception:
+             # Fallback if URL parsing fails
+             target_dir = os.path.join(temp_location, f"secretscan_repo_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
         try:
             clone_depth = [] if check_history else ['--depth=1']
+            
+            # Ensure git is installed
+            subprocess.run(['git', '--version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            
             clone_result = subprocess.run(
                 ['git', 'clone', '--quiet'] + clone_depth + [repo_link, target_dir],
                 capture_output=True,
                 text=True,
-                timeout=180
+                timeout=300 # Increased timeout for cloning
             )
 
             if clone_result.returncode != 0:
@@ -299,6 +375,9 @@ class Scanner:
         except subprocess.TimeoutExpired:
             self.logger.error("[!] Clone timeout")
             return None
+        except FileNotFoundError:
+             self.logger.error("[!] Git not found. Please install git.")
+             return None
         except Exception as err:
             self.logger.error(f"[!] Clone error: {err}")
             return None
@@ -333,7 +412,10 @@ class Scanner:
                     continue
 
                 level_results = grouped_by_severity[level]
-                print(f"\n{level.upper()} ({len(level_results)} finding{'s' if len(level_results) != 1 else ''})")
+                color = 'red' if level in ['critical', 'high'] else 'yellow'
+                
+                header = f"{level.upper()} ({len(level_results)} finding{'s' if len(level_results) != 1 else ''})"
+                print(f"\n{self._colorize(header, color)}")
                 print("-" * 80)
 
                 grouped_by_type = defaultdict(list)
@@ -349,14 +431,20 @@ class Scanner:
                         try:
                             print(f"  [{position}] File: {finding['file']}")
                             print(f"      Line: {finding['line']}")
-                            # Truncate secret if too long to avoid encoding issues
-                            secret = finding['secret'][:50] + "..." if len(finding['secret']) > 50 else finding['secret']
-                            print(f"      Secret: {secret}")
+                            
+                            # Truncate secret if too long
+                            secret_display = finding['secret']
+                            if len(secret_display) > 50:
+                                secret_display = secret_display[:50] + "..."
+                                
+                            print(f"      Secret: {self._colorize(secret_display, 'red')}")
                             print(f"      Entropy: {finding['entropy']}")
-                            if len(finding['context']) > 100:
-                                print(f"      Context: {finding['context'][:100]}...")
-                            else:
-                                print(f"      Context: {finding['context']}")
+                            
+                            context = finding['context']
+                            if len(context) > 100:
+                                context = context[:100] + "..."
+                            print(f"      Context: {context}")
+                            
                             if position < len(type_results[:5]):
                                 print()
                         except Exception as e:
@@ -385,7 +473,7 @@ class Scanner:
             print(f"[!] Error displaying results: {e}")
             print(f"[!] Found {len(self.results)} total secrets (check output file for details)")
 
-    def save_to_json(self, output_path):
+    def save_to_json(self, output_path: str):
         filtered_results = self.results
         if self.severity_filter:
             filtered_results = [r for r in self.results if r['severity'] in self.severity_filter]
@@ -395,7 +483,7 @@ class Scanner:
             'files_scanned': self.files_checked,
             'files_skipped': self.files_ignored,
             'total_findings': len(filtered_results),
-            'severity_filter': self.severity_filter,
+            'severity_filter': list(self.severity_filter) if self.severity_filter else None,
             'scan_duration_seconds': (datetime.now() - self.scan_start_time).total_seconds() if self.scan_start_time else None,
             'findings': [
                 {k: v for k, v in finding.items() if k != '_id'}
@@ -403,11 +491,14 @@ class Scanner:
             ]
         }
 
-        with open(output_path, 'w') as output_file:
-            json.dump(report_data, output_file, indent=2)
-        print(f"\n[+] JSON report saved: {output_path}")
+        try:
+            with open(output_path, 'w') as output_file:
+                json.dump(report_data, output_file, indent=2)
+            print(f"\n[+] JSON report saved: {output_path}")
+        except IOError as e:
+            print(f"\n[!] Error saving JSON report: {e}")
     
-    def save_to_csv(self, output_path):
+    def save_to_csv(self, output_path: str):
         import csv
         
         filtered_results = self.results
@@ -420,17 +511,20 @@ class Scanner:
         
         fieldnames = ['type', 'severity', 'file', 'line', 'secret', 'entropy', 'context']
         
-        with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            
-            for finding in filtered_results:
-                row = {field: finding.get(field, '') for field in fieldnames}
-                writer.writerow(row)
-        
-        print(f"\n[+] CSV report saved: {output_path}")
+        try:
+            with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for finding in filtered_results:
+                    # Filter only fields in fieldnames
+                    row = {field: finding.get(field, '') for field in fieldnames}
+                    writer.writerow(row)
+            print(f"\n[+] CSV report saved: {output_path}")
+        except IOError as e:
+            print(f"\n[!] Error saving CSV report: {e}")
     
-    def save_to_sarif(self, output_path):
+    def save_to_sarif(self, output_path: str):
         """Save results in SARIF format for GitHub security integration"""
         filtered_results = self.results
         if self.severity_filter:
@@ -455,7 +549,7 @@ class Scanner:
             }]
         }
         
-        severity_levels = {
+        severity_map = {
             'critical': 'error',
             'high': 'error', 
             'medium': 'warning',
@@ -465,7 +559,7 @@ class Scanner:
         for finding in filtered_results:
             result = {
                 "ruleId": finding['type'],
-                "level": severity_levels.get(finding['severity'], 'warning'),
+                "level": severity_map.get(finding['severity'], 'warning'),
                 "message": {
                     "text": f"Potential {finding['type']} detected with {finding['severity']} severity"
                 },
@@ -485,7 +579,9 @@ class Scanner:
             }
             sarif_report["runs"][0]["results"].append(result)
         
-        with open(output_path, 'w') as output_file:
-            json.dump(sarif_report, output_file, indent=2)
-        
-        print(f"\n[+] SARIF report saved: {output_path}")
+        try:
+            with open(output_path, 'w') as output_file:
+                json.dump(sarif_report, output_file, indent=2)
+            print(f"\n[+] SARIF report saved: {output_path}")
+        except IOError as e:
+            print(f"\n[!] Error saving SARIF report: {e}")
