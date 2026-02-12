@@ -41,9 +41,6 @@ python3 secretscanner.py scan . -v
 - Private SSH/PGP keys
 - OAuth secrets
 - Stripe API keys
-- And many more
-
-Results categorized by severity: Critical, High, Medium, Low.
 
 ## Options
 
